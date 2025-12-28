@@ -1,0 +1,94 @@
+name: Sync from Upstream
+
+on:
+  # Check for new releases daily
+  schedule:
+    - cron: '0 6 * * *'  # 6 AM UTC daily
+
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      trigger_build:
+        description: 'Trigger Docker build after sync'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  SOURCE_REPO: your-org/agents-gateway  # TODO: Update with actual org/repo
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      new_release: ${{ steps.check.outputs.new_release }}
+      latest_tag: ${{ steps.check.outputs.latest_tag }}
+
+    steps:
+      - name: Check for new releases
+        id: check
+        run: |
+          # Get latest release from upstream
+          LATEST=$(curl -s "https://api.github.com/repos/${{ env.SOURCE_REPO }}/releases/latest" | jq -r '.tag_name // empty')
+
+          if [ -z "$LATEST" ]; then
+            echo "No releases found in upstream repo"
+            echo "new_release=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Latest upstream release: $LATEST"
+          echo "latest_tag=${LATEST}" >> $GITHUB_OUTPUT
+
+          # Check if we've already built this version
+          # Look for existing image tag in GHCR
+          EXISTING=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://ghcr.io/v2/${{ github.repository_owner }}/agents-gateway/tags/list" | \
+            jq -r ".tags[]? | select(. == \"${LATEST}\")" || echo "")
+
+          if [ -n "$EXISTING" ]; then
+            echo "Version $LATEST already built"
+            echo "new_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "New version $LATEST needs to be built"
+            echo "new_release=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Summary
+        run: |
+          echo "## Upstream Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Source Repo:** ${{ env.SOURCE_REPO }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Latest Tag:** ${{ steps.check.outputs.latest_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**New Release:** ${{ steps.check.outputs.new_release }}" >> $GITHUB_STEP_SUMMARY
+
+  trigger-build:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.new_release == 'true' || github.event.inputs.trigger_build == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger Docker build
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = '${{ needs.check-upstream.outputs.latest_tag }}' || 'main';
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'docker-publish.yml',
+              ref: 'main',
+              inputs: {
+                ref: tag,
+                version: tag.replace(/^v/, '')  // Remove 'v' prefix if present
+              }
+            });
+
+            console.log(`Triggered Docker build for ${tag}`);
+
+      - name: Summary
+        run: |
+          echo "## Build Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Triggered Docker build workflow for version: ${{ needs.check-upstream.outputs.latest_tag }}" >> $GITHUB_STEP_SUMMARY
