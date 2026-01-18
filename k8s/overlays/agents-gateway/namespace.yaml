@@ -1,0 +1,8 @@
+# Namespace for agents-gateway deployment
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents-gateway
+  labels:
+    app.kubernetes.io/name: agents-gateway
+    app.kubernetes.io/managed-by: kustomize

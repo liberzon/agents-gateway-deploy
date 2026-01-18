@@ -1,0 +1,45 @@
+# Claude Code
+CLAUDE.md
+
+# Environment files
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Secrets and credentials
+*.pem
+*.key
+secrets/
+credentials/

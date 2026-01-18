@@ -8,87 +8,227 @@ on:
   # Manual trigger
   workflow_dispatch:
     inputs:
+      project:
+        description: 'Project to sync (leave empty for all)'
+        required: false
+        default: ''
       trigger_build:
         description: 'Trigger Docker build after sync'
         required: true
         default: true
         type: boolean
 
-env:
-  SOURCE_REPO: your-org/agents-gateway  # TODO: Update with actual org/repo
-
 jobs:
-  check-upstream:
+  # First job: Load projects from config and create matrix
+  load-projects:
     runs-on: ubuntu-latest
     outputs:
-      new_release: ${{ steps.check.outputs.new_release }}
-      latest_tag: ${{ steps.check.outputs.latest_tag }}
+      projects: ${{ steps.parse.outputs.projects }}
+      project_count: ${{ steps.parse.outputs.project_count }}
+
+    steps:
+      - name: Checkout deployment repo
+        uses: actions/checkout@v4
+
+      - name: Parse projects configuration
+        id: parse
+        run: |
+          # Install yq for YAML parsing
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+          CONFIG_FILE="config/projects.yaml"
+          INPUT_PROJECT="${{ inputs.project }}"
+
+          # Get projects with sync enabled
+          if [ -n "$INPUT_PROJECT" ]; then
+            # Single project specified
+            PROJECTS=$(yq e -o=json "[.projects[] | select(.name == \"${INPUT_PROJECT}\" and .sync.enabled == true) | {name: .name, repo: .source.repo, strategy: (.sync.strategy // \"releases\")}]" "$CONFIG_FILE")
+          else
+            # All projects with sync enabled
+            PROJECTS=$(yq e -o=json "[.projects[] | select(.sync.enabled == true) | {name: .name, repo: .source.repo, strategy: (.sync.strategy // \"releases\")}]" "$CONFIG_FILE")
+          fi
+
+          # Count projects
+          PROJECT_COUNT=$(echo "$PROJECTS" | jq length)
+
+          echo "Found ${PROJECT_COUNT} project(s) to sync"
+          echo "projects=${PROJECTS}" >> $GITHUB_OUTPUT
+          echo "project_count=${PROJECT_COUNT}" >> $GITHUB_OUTPUT
+
+          # Summary
+          echo "## Projects to Sync" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "$PROJECTS" | jq -r '.[] | "- **\(.name)**: \(.repo) (\(.strategy))"' >> $GITHUB_STEP_SUMMARY
+
+  # Check each project for new releases using matrix
+  check-upstream:
+    needs: load-projects
+    if: needs.load-projects.outputs.project_count > 0
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.load-projects.outputs.projects) }}
+
+    outputs:
+      # Note: Matrix outputs are tricky - we use artifacts for results
+      result: ${{ steps.check.outputs.result }}
 
     steps:
       - name: Check for new releases
         id: check
         run: |
-          # Get latest release from upstream
-          LATEST=$(curl -s "https://api.github.com/repos/${{ env.SOURCE_REPO }}/releases/latest" | jq -r '.tag_name // empty')
+          PROJECT="${{ matrix.project.name }}"
+          REPO="${{ matrix.project.repo }}"
+          STRATEGY="${{ matrix.project.strategy }}"
+
+          echo "Checking ${PROJECT} (${REPO}) using ${STRATEGY} strategy..."
+
+          case "$STRATEGY" in
+            releases)
+              # Get latest release
+              LATEST=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest" | jq -r '.tag_name // empty')
+              ;;
+            tags)
+              # Get latest tag
+              LATEST=$(curl -s "https://api.github.com/repos/${REPO}/tags" | jq -r '.[0].name // empty')
+              ;;
+            commits)
+              # Get latest commit SHA (short)
+              LATEST=$(curl -s "https://api.github.com/repos/${REPO}/commits?per_page=1" | jq -r '.[0].sha[:7] // empty')
+              ;;
+          esac
 
           if [ -z "$LATEST" ]; then
-            echo "No releases found in upstream repo"
-            echo "new_release=false" >> $GITHUB_OUTPUT
+            echo "No ${STRATEGY} found in upstream repo"
+            echo "result={\"project\":\"${PROJECT}\",\"new_release\":false,\"tag\":\"\"}" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "Latest upstream release: $LATEST"
-          echo "latest_tag=${LATEST}" >> $GITHUB_OUTPUT
+          echo "Latest upstream ${STRATEGY}: ${LATEST}"
 
           # Check if we've already built this version
           # Look for existing image tag in GHCR
+          IMAGE_NAME=$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')
           EXISTING=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://ghcr.io/v2/${{ github.repository_owner }}/agents-gateway/tags/list" | \
+            "https://ghcr.io/v2/${IMAGE_NAME}/tags/list" 2>/dev/null | \
             jq -r ".tags[]? | select(. == \"${LATEST}\")" || echo "")
 
           if [ -n "$EXISTING" ]; then
-            echo "Version $LATEST already built"
-            echo "new_release=false" >> $GITHUB_OUTPUT
+            echo "Version ${LATEST} already built"
+            echo "result={\"project\":\"${PROJECT}\",\"new_release\":false,\"tag\":\"${LATEST}\"}" >> $GITHUB_OUTPUT
           else
-            echo "New version $LATEST needs to be built"
-            echo "new_release=true" >> $GITHUB_OUTPUT
+            echo "New version ${LATEST} needs to be built"
+            echo "result={\"project\":\"${PROJECT}\",\"new_release\":true,\"tag\":\"${LATEST}\"}" >> $GITHUB_OUTPUT
           fi
+
+      - name: Save check result
+        run: |
+          mkdir -p /tmp/results
+          echo '${{ steps.check.outputs.result }}' > /tmp/results/${{ matrix.project.name }}.json
+
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-result-${{ matrix.project.name }}
+          path: /tmp/results/${{ matrix.project.name }}.json
+          retention-days: 1
 
       - name: Summary
         run: |
-          echo "## Upstream Check Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Source Repo:** ${{ env.SOURCE_REPO }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Latest Tag:** ${{ steps.check.outputs.latest_tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "**New Release:** ${{ steps.check.outputs.new_release }}" >> $GITHUB_STEP_SUMMARY
+          RESULT='${{ steps.check.outputs.result }}'
+          PROJECT=$(echo "$RESULT" | jq -r '.project')
+          NEW_RELEASE=$(echo "$RESULT" | jq -r '.new_release')
+          TAG=$(echo "$RESULT" | jq -r '.tag')
 
-  trigger-build:
-    needs: check-upstream
-    if: needs.check-upstream.outputs.new_release == 'true' || github.event.inputs.trigger_build == 'true'
+          echo "## Check Result: ${PROJECT}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Latest Tag:** ${TAG}" >> $GITHUB_STEP_SUMMARY
+          echo "- **New Release:** ${NEW_RELEASE}" >> $GITHUB_STEP_SUMMARY
+
+  # Aggregate results and trigger builds
+  trigger-builds:
+    needs: [load-projects, check-upstream]
     runs-on: ubuntu-latest
+    if: always() && needs.check-upstream.result == 'success'
 
     steps:
-      - name: Trigger Docker build
+      - name: Download all check results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: check-result-*
+          path: /tmp/results
+          merge-multiple: true
+
+      - name: Process results and trigger builds
         uses: actions/github-script@v7
         with:
           script: |
-            const tag = '${{ needs.check-upstream.outputs.latest_tag }}' || 'main';
+            const fs = require('fs');
+            const path = require('path');
 
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'docker-publish.yml',
-              ref: 'main',
-              inputs: {
-                ref: tag,
-                version: tag.replace(/^v/, '')  // Remove 'v' prefix if present
+            const resultsDir = '/tmp/results';
+            const triggerBuild = '${{ inputs.trigger_build }}' !== 'false';
+
+            let triggeredBuilds = [];
+            let skippedProjects = [];
+
+            // Read all result files
+            const files = fs.readdirSync(resultsDir).filter(f => f.endsWith('.json'));
+
+            for (const file of files) {
+              const content = fs.readFileSync(path.join(resultsDir, file), 'utf8');
+              const result = JSON.parse(content);
+
+              console.log(`Processing ${result.project}: new_release=${result.new_release}, tag=${result.tag}`);
+
+              if (result.new_release && triggerBuild) {
+                console.log(`Triggering build for ${result.project}@${result.tag}`);
+
+                try {
+                  await github.rest.actions.createWorkflowDispatch({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    workflow_id: 'docker-build.yml',
+                    ref: 'main',
+                    inputs: {
+                      project: result.project,
+                      ref: result.tag,
+                      version: result.tag.replace(/^v/, ''),
+                      trigger_deploy: 'true'
+                    }
+                  });
+
+                  triggeredBuilds.push({ project: result.project, tag: result.tag });
+                } catch (error) {
+                  console.error(`Failed to trigger build for ${result.project}: ${error.message}`);
+                }
+              } else {
+                skippedProjects.push({ project: result.project, tag: result.tag, reason: result.new_release ? 'trigger_build=false' : 'already_built' });
               }
-            });
+            }
 
-            console.log(`Triggered Docker build for ${tag}`);
+            // Set outputs for summary
+            core.setOutput('triggered_builds', JSON.stringify(triggeredBuilds));
+            core.setOutput('skipped_projects', JSON.stringify(skippedProjects));
 
-      - name: Summary
+      - name: Generate summary
         run: |
-          echo "## Build Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "## Sync Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Triggered Docker build workflow for version: ${{ needs.check-upstream.outputs.latest_tag }}" >> $GITHUB_STEP_SUMMARY
+
+          # List all result files
+          for f in /tmp/results/*.json; do
+            if [ -f "$f" ]; then
+              PROJECT=$(jq -r '.project' "$f")
+              NEW_RELEASE=$(jq -r '.new_release' "$f")
+              TAG=$(jq -r '.tag' "$f")
+
+              if [ "$NEW_RELEASE" = "true" ]; then
+                echo "- ✅ **${PROJECT}**: New release \`${TAG}\` - build triggered" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "- ⏭️ **${PROJECT}**: \`${TAG}\` already built" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          done

@@ -1,0 +1,380 @@
+name: Deploy to Kubernetes
+
+on:
+  # Trigger after docker-build completes
+  workflow_run:
+    workflows: ["Build and Publish Docker Images"]
+    types:
+      - completed
+    branches:
+      - main
+
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project name (from projects.yaml)'
+        required: true
+        default: 'agents-gateway'
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: true
+        default: 'latest'
+
+  # Called by docker-build workflow
+  workflow_call:
+    inputs:
+      project:
+        description: 'Project name'
+        required: true
+        type: string
+      environment:
+        description: 'Deployment environment'
+        required: true
+        type: string
+        default: 'production'
+      image_tag:
+        description: 'Docker image tag'
+        required: true
+        type: string
+
+jobs:
+  load-config:
+    runs-on: ubuntu-latest
+    outputs:
+      namespace: ${{ steps.parse.outputs.namespace }}
+      image_registry: ${{ steps.parse.outputs.image_registry }}
+      image_name: ${{ steps.parse.outputs.image_name }}
+      auth_type: ${{ steps.parse.outputs.auth_type }}
+      kubeconfig_secret: ${{ steps.parse.outputs.kubeconfig_secret }}
+      gke_project: ${{ steps.parse.outputs.gke_project }}
+      gke_cluster: ${{ steps.parse.outputs.gke_cluster }}
+      gke_region: ${{ steps.parse.outputs.gke_region }}
+      gke_sa_secret: ${{ steps.parse.outputs.gke_sa_secret }}
+      health_path: ${{ steps.parse.outputs.health_path }}
+      env_secrets: ${{ steps.parse.outputs.env_secrets }}
+
+    steps:
+      - name: Checkout deployment repo
+        uses: actions/checkout@v4
+
+      - name: Determine project name
+        id: project
+        run: |
+          PROJECT="${{ inputs.project || 'agents-gateway' }}"
+          echo "name=${PROJECT}" >> $GITHUB_OUTPUT
+
+      - name: Parse project configuration
+        id: parse
+        run: |
+          PROJECT="${{ steps.project.outputs.name }}"
+
+          # Install yq for YAML parsing
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+          CONFIG_FILE="config/projects.yaml"
+
+          if ! yq e ".projects[] | select(.name == \"${PROJECT}\")" "$CONFIG_FILE" > /dev/null 2>&1; then
+            echo "::error::Project '${PROJECT}' not found in projects.yaml"
+            exit 1
+          fi
+
+          # Extract Kubernetes config
+          NAMESPACE=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.namespace" "$CONFIG_FILE")
+          IMAGE_REGISTRY=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .image.registry" "$CONFIG_FILE")
+          IMAGE_NAME=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .image.name" "$CONFIG_FILE")
+
+          # Authentication config
+          AUTH_TYPE=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.auth.type" "$CONFIG_FILE")
+          KUBECONFIG_SECRET=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.auth.secretName // \"\"" "$CONFIG_FILE")
+
+          # GKE-specific config
+          GKE_PROJECT=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.auth.project // \"\"" "$CONFIG_FILE")
+          GKE_CLUSTER=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.auth.cluster // \"\"" "$CONFIG_FILE")
+          GKE_REGION=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.auth.region // \"\"" "$CONFIG_FILE")
+          GKE_SA_SECRET=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.auth.serviceAccountKey // \"\"" "$CONFIG_FILE")
+
+          # Health check config
+          HEALTH_PATH=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.healthCheck.path // \"/health\"" "$CONFIG_FILE")
+
+          # Environment secrets mapping (as JSON)
+          ENV_SECRETS=$(yq e -o=json ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.envFromSecrets // {}" "$CONFIG_FILE")
+
+          echo "namespace=${NAMESPACE}" >> $GITHUB_OUTPUT
+          echo "image_registry=${IMAGE_REGISTRY}" >> $GITHUB_OUTPUT
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "auth_type=${AUTH_TYPE}" >> $GITHUB_OUTPUT
+          echo "kubeconfig_secret=${KUBECONFIG_SECRET}" >> $GITHUB_OUTPUT
+          echo "gke_project=${GKE_PROJECT}" >> $GITHUB_OUTPUT
+          echo "gke_cluster=${GKE_CLUSTER}" >> $GITHUB_OUTPUT
+          echo "gke_region=${GKE_REGION}" >> $GITHUB_OUTPUT
+          echo "gke_sa_secret=${GKE_SA_SECRET}" >> $GITHUB_OUTPUT
+          echo "health_path=${HEALTH_PATH}" >> $GITHUB_OUTPUT
+          echo "env_secrets=${ENV_SECRETS}" >> $GITHUB_OUTPUT
+
+          echo "## Deployment Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Project:** ${PROJECT}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Namespace:** ${NAMESPACE}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${IMAGE_REGISTRY}/${IMAGE_NAME}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Auth Type:** ${AUTH_TYPE}" >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    needs: load-config
+    runs-on: ubuntu-latest
+    # Only run if this is a manual trigger, workflow_call, or if workflow_run succeeded
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || github.event.workflow_run.conclusion == 'success' }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      PROJECT: ${{ inputs.project || 'agents-gateway' }}
+      ENVIRONMENT: ${{ inputs.environment || 'production' }}
+      IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
+
+    steps:
+      - name: Checkout deployment repo
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      # Kubeconfig-based authentication
+      - name: Configure kubectl (kubeconfig)
+        if: needs.load-config.outputs.auth_type == 'kubeconfig'
+        run: |
+          KUBECONFIG_SECRET="${{ needs.load-config.outputs.kubeconfig_secret }}"
+          mkdir -p ~/.kube
+
+          # Get the kubeconfig from the dynamically named secret
+          # Note: We use environment variable indirection
+          KUBECONFIG_CONTENT="${{ secrets[needs.load-config.outputs.kubeconfig_secret] }}"
+
+          if [ -z "$KUBECONFIG_CONTENT" ]; then
+            echo "::error::Kubeconfig secret '${KUBECONFIG_SECRET}' is empty or not set"
+            exit 1
+          fi
+
+          echo "$KUBECONFIG_CONTENT" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+          echo "Kubeconfig configured successfully"
+
+      # GKE-native authentication
+      - name: Authenticate to GKE
+        if: needs.load-config.outputs.auth_type == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets[needs.load-config.outputs.gke_sa_secret] }}
+
+      - name: Set up GKE credentials
+        if: needs.load-config.outputs.auth_type == 'gke'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          project_id: ${{ needs.load-config.outputs.gke_project }}
+          cluster_name: ${{ needs.load-config.outputs.gke_cluster }}
+          location: ${{ needs.load-config.outputs.gke_region }}
+
+      - name: Verify cluster connection
+        run: |
+          echo "Testing cluster connection..."
+          kubectl cluster-info
+          kubectl get nodes --no-headers | head -3
+
+      - name: Create namespace
+        run: |
+          NAMESPACE="${{ needs.load-config.outputs.namespace }}"
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create secrets from GitHub secrets
+        env:
+          ENV_SECRETS_JSON: ${{ needs.load-config.outputs.env_secrets }}
+          # Pass all potential secrets - workflow will pick the ones it needs
+          DB_USER_AGENTS_GATEWAY: ${{ secrets.DB_USER_AGENTS_GATEWAY }}
+          DB_PASS_AGENTS_GATEWAY: ${{ secrets.DB_PASS_AGENTS_GATEWAY }}
+          DB_HOST_AGENTS_GATEWAY: ${{ secrets.DB_HOST_AGENTS_GATEWAY }}
+          DB_PORT_AGENTS_GATEWAY: ${{ secrets.DB_PORT_AGENTS_GATEWAY }}
+          DB_DATABASE_AGENTS_GATEWAY: ${{ secrets.DB_DATABASE_AGENTS_GATEWAY }}
+          SERVICE_PROMPTS_AGENTS_GATEWAY: ${{ secrets.SERVICE_PROMPTS_AGENTS_GATEWAY }}
+          GOOGLE_API_KEY_AGENTS_GATEWAY: ${{ secrets.GOOGLE_API_KEY_AGENTS_GATEWAY }}
+          QDRANT_URL_AGENTS_GATEWAY: ${{ secrets.QDRANT_URL_AGENTS_GATEWAY }}
+          QDRANT_API_KEY_AGENTS_GATEWAY: ${{ secrets.QDRANT_API_KEY_AGENTS_GATEWAY }}
+          SECRET_TOKEN_ENC_KEY_AGENTS_GATEWAY: ${{ secrets.SECRET_TOKEN_ENC_KEY_AGENTS_GATEWAY }}
+          # Legacy secrets (for backward compatibility)
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_DATABASE: ${{ secrets.DB_DATABASE }}
+          SERVICE_PROMPTS: ${{ secrets.SERVICE_PROMPTS }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+          SECRET_TOKEN_ENC_KEY: ${{ secrets.SECRET_TOKEN_ENC_KEY }}
+        run: |
+          NAMESPACE="${{ needs.load-config.outputs.namespace }}"
+
+          # Install jq for JSON parsing
+          sudo apt-get install -y jq > /dev/null 2>&1
+
+          # Create secret from environment mappings
+          echo "Creating Kubernetes secrets..."
+
+          # Start building the secret command
+          SECRET_CMD="kubectl create secret generic ${{ env.PROJECT }}-app-secrets -n ${NAMESPACE}"
+
+          # Parse the env secrets JSON and create --from-literal entries
+          echo "$ENV_SECRETS_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"' | while read mapping; do
+            ENV_NAME="${mapping%%=*}"
+            SECRET_NAME="${mapping#*=}"
+
+            # Get the value from the corresponding environment variable
+            SECRET_VALUE="${!SECRET_NAME:-${!ENV_NAME}}"
+
+            if [ -n "$SECRET_VALUE" ]; then
+              echo "  - ${ENV_NAME} (from ${SECRET_NAME})"
+              SECRET_CMD="$SECRET_CMD --from-literal=${ENV_NAME}=${SECRET_VALUE}"
+            fi
+          done
+
+          # Apply the secret
+          eval "$SECRET_CMD --dry-run=client -o yaml" | kubectl apply -f -
+
+          echo "Secrets created successfully"
+
+      - name: Update kustomization with image tag
+        run: |
+          cd k8s/overlays/${{ env.PROJECT }}
+
+          # Update the image tag in kustomization
+          kustomize edit set image placeholder=${{ needs.load-config.outputs.image_registry }}/${{ needs.load-config.outputs.image_name }}:${{ env.IMAGE_TAG }}
+
+          # Add environment label
+          cat >> kustomization.yaml << EOF
+
+          # Environment-specific configuration
+          commonAnnotations:
+            deployment.kubernetes.io/revision: "${{ github.run_number }}"
+            app.kubernetes.io/version: "${{ env.IMAGE_TAG }}"
+          EOF
+
+          echo "Updated kustomization.yaml:"
+          cat kustomization.yaml
+
+      - name: Deploy with kustomize
+        run: |
+          NAMESPACE="${{ needs.load-config.outputs.namespace }}"
+
+          echo "Building kustomize manifests..."
+          kustomize build k8s/overlays/${{ env.PROJECT }} > /tmp/manifests.yaml
+
+          echo "Applying manifests to namespace: ${NAMESPACE}"
+          kubectl apply -f /tmp/manifests.yaml
+
+          echo "Waiting for deployment rollout..."
+          kubectl rollout status deployment/${{ env.PROJECT }}-app -n ${NAMESPACE} --timeout=300s
+
+      - name: Get deployment status
+        id: status
+        run: |
+          NAMESPACE="${{ needs.load-config.outputs.namespace }}"
+
+          # Get pod status
+          echo "## Pod Status"
+          kubectl get pods -n ${NAMESPACE} -l app.kubernetes.io/name=${{ env.PROJECT }}
+
+          # Get service info
+          echo ""
+          echo "## Service Info"
+          kubectl get svc -n ${NAMESPACE}
+
+          # Get the cluster IP or external IP
+          SERVICE_IP=$(kubectl get svc ${{ env.PROJECT }}-app -n ${NAMESPACE} -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+          echo "service_ip=${SERVICE_IP}" >> $GITHUB_OUTPUT
+
+      - name: Verify deployment health
+        run: |
+          NAMESPACE="${{ needs.load-config.outputs.namespace }}"
+          HEALTH_PATH="${{ needs.load-config.outputs.health_path }}"
+
+          echo "Verifying deployment health..."
+
+          # Get a pod name
+          POD=$(kubectl get pods -n ${NAMESPACE} -l app.kubernetes.io/name=${{ env.PROJECT }} -o jsonpath='{.items[0].metadata.name}')
+
+          if [ -z "$POD" ]; then
+            echo "::error::No pods found for deployment"
+            exit 1
+          fi
+
+          echo "Using pod: ${POD}"
+
+          # Wait for pod to be ready
+          kubectl wait --for=condition=ready pod/${POD} -n ${NAMESPACE} --timeout=120s
+
+          # Port-forward and check health
+          kubectl port-forward pod/${POD} 8080:8080 -n ${NAMESPACE} &
+          PF_PID=$!
+          sleep 5
+
+          # Check health endpoint
+          HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8080${HEALTH_PATH}" || echo "000")
+
+          kill $PF_PID 2>/dev/null || true
+
+          if [ "$HEALTH_STATUS" = "200" ]; then
+            echo "✅ Health check passed! (HTTP ${HEALTH_STATUS})"
+          else
+            echo "::error::Health check failed! (HTTP ${HEALTH_STATUS})"
+            kubectl logs ${POD} -n ${NAMESPACE} --tail=50
+            exit 1
+          fi
+
+      - name: Generate deployment summary
+        run: |
+          NAMESPACE="${{ needs.load-config.outputs.namespace }}"
+
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Project:** ${{ env.PROJECT }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace:** ${NAMESPACE}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ needs.load-config.outputs.image_registry }}/${{ needs.load-config.outputs.image_name }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Resources" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          kubectl get all -n ${NAMESPACE} -l app.kubernetes.io/name=${{ env.PROJECT }} >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Health Check" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Service is healthy at \`${{ needs.load-config.outputs.health_path }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup on failure
+        if: failure()
+        run: |
+          NAMESPACE="${{ needs.load-config.outputs.namespace }}"
+          echo "Deployment failed. Collecting debug information..."
+          echo ""
+          echo "## Pod Events"
+          kubectl describe pods -n ${NAMESPACE} -l app.kubernetes.io/name=${{ env.PROJECT }}
+          echo ""
+          echo "## Recent Events"
+          kubectl get events -n ${NAMESPACE} --sort-by='.lastTimestamp' | tail -20

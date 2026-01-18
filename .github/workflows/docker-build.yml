@@ -1,0 +1,253 @@
+name: Build and Publish Docker Images
+
+on:
+  # Trigger from sync workflow or external repos
+  repository_dispatch:
+    types: [upstream-release]
+
+  # Manual trigger with project selection
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Project name (from projects.yaml)'
+        required: true
+        default: 'agents-gateway'
+      ref:
+        description: 'Git ref to build (tag, branch, or commit SHA)'
+        required: true
+        default: 'main'
+      version:
+        description: 'Version tag for the image (e.g., 1.0.0)'
+        required: false
+        default: ''
+      trigger_deploy:
+        description: 'Trigger Kubernetes deployment after build'
+        required: true
+        default: true
+        type: boolean
+
+  # Called by sync-upstream workflow
+  workflow_call:
+    inputs:
+      project:
+        description: 'Project name'
+        required: true
+        type: string
+      ref:
+        description: 'Git ref to build'
+        required: true
+        type: string
+      version:
+        description: 'Version tag'
+        required: false
+        type: string
+        default: ''
+      trigger_deploy:
+        description: 'Trigger deployment'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  load-config:
+    runs-on: ubuntu-latest
+    outputs:
+      project_config: ${{ steps.parse.outputs.config }}
+      source_repo: ${{ steps.parse.outputs.source_repo }}
+      image_registry: ${{ steps.parse.outputs.image_registry }}
+      image_name: ${{ steps.parse.outputs.image_name }}
+      platforms: ${{ steps.parse.outputs.platforms }}
+
+    steps:
+      - name: Checkout deployment repo
+        uses: actions/checkout@v4
+
+      - name: Determine project name
+        id: project
+        run: |
+          # Get project from inputs or repository_dispatch payload
+          PROJECT="${{ inputs.project || github.event.client_payload.project || 'agents-gateway' }}"
+          echo "name=${PROJECT}" >> $GITHUB_OUTPUT
+
+      - name: Parse project configuration
+        id: parse
+        run: |
+          PROJECT="${{ steps.project.outputs.name }}"
+
+          # Install yq for YAML parsing
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+          # Extract project config
+          CONFIG_FILE="config/projects.yaml"
+
+          if ! yq e ".projects[] | select(.name == \"${PROJECT}\")" "$CONFIG_FILE" > /dev/null 2>&1; then
+            echo "::error::Project '${PROJECT}' not found in projects.yaml"
+            exit 1
+          fi
+
+          # Extract values
+          SOURCE_REPO=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .source.repo" "$CONFIG_FILE")
+          IMAGE_REGISTRY=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .image.registry" "$CONFIG_FILE")
+          IMAGE_NAME=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .image.name" "$CONFIG_FILE")
+
+          # Get platforms (default to amd64,arm64)
+          PLATFORMS=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .build.platforms | join(\",\")" "$CONFIG_FILE")
+          if [ -z "$PLATFORMS" ] || [ "$PLATFORMS" = "null" ]; then
+            PLATFORMS="linux/amd64,linux/arm64"
+          fi
+
+          # Get full project config as JSON for later use
+          PROJECT_CONFIG=$(yq e -o=json ".projects[] | select(.name == \"${PROJECT}\")" "$CONFIG_FILE")
+
+          echo "source_repo=${SOURCE_REPO}" >> $GITHUB_OUTPUT
+          echo "image_registry=${IMAGE_REGISTRY}" >> $GITHUB_OUTPUT
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "platforms=${PLATFORMS}" >> $GITHUB_OUTPUT
+          echo "config=${PROJECT_CONFIG}" >> $GITHUB_OUTPUT
+
+          echo "## Project Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Project:** ${PROJECT}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source Repo:** ${SOURCE_REPO}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${IMAGE_REGISTRY}/${IMAGE_NAME}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platforms:** ${PLATFORMS}" >> $GITHUB_STEP_SUMMARY
+
+  build-and-push:
+    needs: load-config
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image_tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.load-config.outputs.source_repo }}
+          ref: ${{ inputs.ref || github.event.client_payload.ref || 'main' }}
+          fetch-depth: 0
+
+      - name: Get version from tag or input
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          elif [ -n "${{ github.event.client_payload.version }}" ]; then
+            echo "version=${{ github.event.client_payload.version }}" >> $GITHUB_OUTPUT
+          else
+            # Use git describe for version, fallback to short SHA
+            VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ needs.load-config.outputs.image_registry }}/${{ needs.load-config.outputs.image_name }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.project || github.event.client_payload.project || 'agents-gateway' }}
+          tags: |
+            # Version tag from input or payload
+            type=raw,value=${{ steps.version.outputs.version }}
+            # Semantic version tags (if version looks like semver)
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}},value=${{ steps.version.outputs.version }}
+            # Latest tag for main branch
+            type=raw,value=latest,enable=${{ inputs.ref == 'main' || github.event.client_payload.ref == 'main' || github.ref == 'refs/heads/main' }}
+            # Git SHA
+            type=sha,prefix=
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: ${{ needs.load-config.outputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.version.outputs.version }}
+
+      - name: Generate build summary
+        run: |
+          echo "## Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Project:** ${{ inputs.project || github.event.client_payload.project || 'agents-gateway' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Source:** ${{ needs.load-config.outputs.source_repo }}@${{ inputs.ref || github.event.client_payload.ref || 'main' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Published Images" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Platforms" >> $GITHUB_STEP_SUMMARY
+          echo "${{ needs.load-config.outputs.platforms }}" | tr ',' '\n' | while read p; do
+            echo "- ${p}" >> $GITHUB_STEP_SUMMARY
+          done
+
+  trigger-deploy:
+    needs: [load-config, build-and-push]
+    if: inputs.trigger_deploy == true || github.event.client_payload.trigger_deploy == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger Kubernetes deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const project = '${{ inputs.project || github.event.client_payload.project || 'agents-gateway' }}';
+            const version = '${{ needs.build-and-push.outputs.version }}';
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deploy-k8s.yml',
+              ref: 'main',
+              inputs: {
+                project: project,
+                environment: 'production',
+                image_tag: version
+              }
+            });
+
+            console.log(`Triggered Kubernetes deployment for ${project}:${version}`);
+
+      - name: Summary
+        run: |
+          echo "## Deployment Triggered" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Triggered Kubernetes deployment workflow for:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Project:** ${{ inputs.project || github.event.client_payload.project || 'agents-gateway' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ needs.build-and-push.outputs.version }}" >> $GITHUB_STEP_SUMMARY

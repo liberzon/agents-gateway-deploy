@@ -1,0 +1,12 @@
+# Generic ConfigMap template
+# Non-sensitive environment configuration
+# Values are patched by overlays using kustomize
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  labels:
+    app.kubernetes.io/name: app
+data:
+  # Environment indicator (overridden by overlays)
+  ENVIRONMENT: "development"

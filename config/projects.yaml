@@ -1,0 +1,134 @@
+# Multi-Project Kubernetes Deployment Configuration
+# This file defines all OSS projects to track, build, and deploy
+
+apiVersion: v1
+kind: ProjectConfig
+
+# Default settings applied to all projects (can be overridden per-project)
+defaults:
+  dockerfile: "./Dockerfile"
+  branch: "main"
+  healthPath: "/health"
+  healthTimeout: 60
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+  replicas:
+    min: 1
+    max: 3
+
+# List of projects to track and deploy
+projects:
+  - name: agents-gateway
+    description: "AI Agents Gateway Service"
+
+    # Source repository configuration
+    source:
+      repo: liberzon/agents-gateway
+      branch: main
+
+    # Docker image configuration
+    image:
+      registry: ghcr.io
+      name: liberzon/agents-gateway
+      # Also push to Docker Hub (optional)
+      additionalRegistries:
+        - registry: docker.io
+          name: "${DOCKERHUB_USERNAME}/agents-gateway"
+
+    # Build configuration
+    build:
+      dockerfile: "./Dockerfile"
+      platforms:
+        - linux/amd64
+        - linux/arm64
+      args: {}
+
+    # Kubernetes deployment configuration
+    kubernetes:
+      namespace: agents-gateway
+
+      # Authentication method for cluster access
+      auth:
+        # Kubeconfig-based auth (works with any cluster)
+        type: kubeconfig
+        secretName: KUBECONFIG_AGENTS_GATEWAY  # GitHub secret containing base64-encoded kubeconfig
+
+        # Alternative: GKE native auth (uncomment to use)
+        # type: gke
+        # project: my-gcp-project
+        # cluster: my-cluster
+        # region: us-central1
+        # serviceAccountKey: GCP_SA_KEY_AGENTS_GATEWAY
+
+      # Environment variables mapped to GitHub secrets
+      envFromSecrets:
+        DB_USER: DB_USER_AGENTS_GATEWAY
+        DB_PASS: DB_PASS_AGENTS_GATEWAY
+        DB_HOST: DB_HOST_AGENTS_GATEWAY
+        DB_PORT: DB_PORT_AGENTS_GATEWAY
+        DB_DATABASE: DB_DATABASE_AGENTS_GATEWAY
+        SERVICE_PROMPTS: SERVICE_PROMPTS_AGENTS_GATEWAY
+        GOOGLE_API_KEY: GOOGLE_API_KEY_AGENTS_GATEWAY
+        QDRANT_URL: QDRANT_URL_AGENTS_GATEWAY
+        QDRANT_API_KEY: QDRANT_API_KEY_AGENTS_GATEWAY
+        SECRET_TOKEN_ENC_KEY: SECRET_TOKEN_ENC_KEY_AGENTS_GATEWAY
+
+      # Static environment variables (non-sensitive)
+      env:
+        ENVIRONMENT: production
+
+      # Resource overrides (uses defaults if not specified)
+      resources:
+        requests:
+          memory: "256Mi"
+          cpu: "100m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+
+      # Health check configuration
+      healthCheck:
+        path: /health
+        port: 8080
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        timeoutSeconds: 5
+        failureThreshold: 3
+
+      # Service configuration
+      service:
+        port: 80
+        targetPort: 8080
+        type: ClusterIP
+
+    # Upstream sync configuration
+    sync:
+      enabled: true
+      strategy: releases  # Options: releases, tags, commits
+      # Cron schedule for checking (uses workflow schedule if not specified)
+      # schedule: "0 6 * * *"
+
+  # Example: Add another project (commented out as template)
+  # - name: another-service
+  #   description: "Another OSS service to deploy"
+  #   source:
+  #     repo: org/another-service
+  #     branch: main
+  #   image:
+  #     registry: ghcr.io
+  #     name: org/another-service
+  #   kubernetes:
+  #     namespace: another-service
+  #     auth:
+  #       type: kubeconfig
+  #       secretName: KUBECONFIG_ANOTHER_SERVICE
+  #     envFromSecrets:
+  #       API_KEY: API_KEY_ANOTHER_SERVICE
+  #   sync:
+  #     enabled: true
+  #     strategy: releases
