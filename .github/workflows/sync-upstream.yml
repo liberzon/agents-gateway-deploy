@@ -40,13 +40,13 @@ jobs:
           CONFIG_FILE="config/projects.yaml"
           INPUT_PROJECT="${{ inputs.project }}"
 
-          # Get projects with sync enabled
+          # Get projects with sync enabled - convert to JSON then use jq for transformation
           if [ -n "$INPUT_PROJECT" ]; then
             # Single project specified
-            PROJECTS=$(yq e -o=json "[.projects[] | select(.name == \"${INPUT_PROJECT}\" and .sync.enabled == true) | {name: .name, repo: .source.repo, strategy: (.sync.strategy // \"releases\")}]" "$CONFIG_FILE")
+            PROJECTS=$(yq e -o=json '.projects' "$CONFIG_FILE" | jq -c "[.[] | select(.name == \"${INPUT_PROJECT}\" and .sync.enabled == true) | {name: .name, repo: .source.repo, strategy: (.sync.strategy // \"releases\")}]")
           else
             # All projects with sync enabled
-            PROJECTS=$(yq e -o=json "[.projects[] | select(.sync.enabled == true) | {name: .name, repo: .source.repo, strategy: (.sync.strategy // \"releases\")}]" "$CONFIG_FILE")
+            PROJECTS=$(yq e -o=json '.projects' "$CONFIG_FILE" | jq -c '[.[] | select(.sync.enabled == true) | {name: .name, repo: .source.repo, strategy: (.sync.strategy // "releases")}]')
           fi
 
           # Count projects
