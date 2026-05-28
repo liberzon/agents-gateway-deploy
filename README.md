@@ -1,34 +1,146 @@
-# Multi-Project Kubernetes Deployment Platform
+# agents-gateway-deploy
 
-A vendor-agnostic, multi-project deployment platform for OSS projects. Tracks upstream repositories, builds Docker images, and deploys to any Kubernetes cluster.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![App Python](https://img.shields.io/badge/Python%20(app)-3.11+-blue.svg)](https://github.com/liberzon/agents-gateway)
+[![Image](https://img.shields.io/badge/Image-ghcr.io%2Fliberzon%2Fagents--gateway-2496ED.svg?logo=docker)](https://github.com/liberzon/agents-gateway/pkgs/container/agents-gateway)
+[![Source](https://img.shields.io/badge/Source-liberzon%2Fagents--gateway-181717.svg?logo=github)](https://github.com/liberzon/agents-gateway)
+
+Deployment artifacts for [**agents-gateway**](https://github.com/liberzon/agents-gateway) — an AI agents gateway built with FastAPI and Agno. This repo packages everything needed to run it on someone else's infrastructure:
+
+- **One-click platform deploys** to Render, Railway, and Koyeb (image-based, no source build).
+- **Kubernetes manifests** for self-hosters running their own cluster.
+- **Build pipeline** that publishes the prebuilt image to GHCR.
+
+The app itself lives in [`liberzon/agents-gateway`](https://github.com/liberzon/agents-gateway) — runs on **Python 3.11+** (image base: `python:3.14-slim`). This repo doesn't contain Python; it just deploys the image.
+
+---
+
+## Deploy in one click
+
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template?template=https://github.com/liberzon/agents-gateway-deploy)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/liberzon/agents-gateway-deploy)
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?type=git&repository=github.com/liberzon/agents-gateway-deploy)
+
+All three pull the prebuilt image **`ghcr.io/liberzon/agents-gateway:latest`** (public, multi-arch: `linux/amd64` + `linux/arm64`). You supply DB connection + LLM API key at deploy time; the app boots and exposes the v2 API.
+
+For step-by-step instructions per platform — provisioning Postgres, env vars to set, a curl-based smoke test, costs, and teardown — see **[`DEPLOY_TEST_PLAN.md`](DEPLOY_TEST_PLAN.md)**.
+
+---
+
+## What's in this repo
+
+```
+.
+├── render.yaml              # Render Blueprint (image-based deploy)
+├── koyeb.yaml               # Koyeb service spec (image-based deploy)
+├── railway.toml             # Railway config (uses Dockerfile below)
+├── Dockerfile               # Thin wrapper: FROM ghcr.io/liberzon/agents-gateway
+├── DEPLOY_TEST_PLAN.md      # Per-platform smoke-test playbook
+│
+├── config/
+│   └── projects.yaml        # Image/source/k8s config (drives the build workflow)
+│
+├── k8s/
+│   ├── base/                # Generic Kubernetes manifests (kustomize)
+│   └── overlays/
+│       └── agents-gateway/  # Per-project customisations
+│
+└── .github/workflows/
+    ├── docker-build.yml     # Build + push multi-platform image to GHCR
+    ├── deploy-k8s.yml       # Apply kustomize manifests to a target cluster
+    └── sync-upstream.yml    # Periodically rebuild when upstream tags release
+```
+
+---
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────┐      ┌─────────────────────────────────────────────┐
-│  PUBLIC: agents-gateway         │      │  PRIVATE: agents-gateway-deploy             │
-│  (Open Source Code)             │      │  (This Repository)                          │
+│  liberzon/agents-gateway        │      │  liberzon/agents-gateway-deploy             │
+│  (Source code, MIT)             │      │  (This repository, MIT)                     │
 │                                 │      │                                             │
-│  - Source code                  │◄─────│  config/projects.yaml  - Project registry  │
-│  - Dockerfile                   │      │  k8s/base/             - Base manifests    │
-│  - CI (lint/test only)          │      │  k8s/overlays/         - Per-project config│
-│  - No secrets/credentials       │      │  .github/workflows/    - CI/CD pipelines   │
-│                                 │      │                                             │
+│  • FastAPI + Agno (Python 3.11+)│      │  • config/projects.yaml — image / source   │
+│  • Dockerfile                   │◄─────│  • render.yaml / koyeb.yaml / railway.toml │
+│  • CI: lint / tests / scans     │      │  • k8s/                — kustomize overlays│
+│                                 │      │  • workflows           — build & deploy    │
 └─────────────────────────────────┘      └─────────────────────────────────────────────┘
+              │                                              │
+              │  docker-build.yml builds the image           │
+              └──────────────┬───────────────────────────────┘
+                             ▼
+            ghcr.io/liberzon/agents-gateway:latest  (public)
+                             │
+        ┌────────────────────┼─────────────────────┐
+        ▼                    ▼                     ▼
+    Render             Koyeb                Railway / K8s
+    (render.yaml)      (koyeb.yaml)         (railway.toml / k8s/)
 ```
 
-## Features
+---
 
-- **Multi-Project Support**: Track and deploy multiple OSS projects from a single repository
-- **Vendor-Agnostic Kubernetes**: Deploy to any K8s cluster (GKE, EKS, AKS, on-prem)
-- **Flexible Authentication**: Kubeconfig or cloud-native auth (GKE Workload Identity)
-- **Kustomize-based Deployments**: Base manifests with per-project overlays
-- **Automated Sync**: Daily checks for upstream releases with parallel processing
-- **Multi-Platform Builds**: amd64 and arm64 Docker images
+## Deploy paths in detail
 
-## Project Configuration
+### 1. One-click platform deploys (recommended for most users)
 
-Projects are defined in `config/projects.yaml`:
+| Platform | Config | Mechanism |
+|---|---|---|
+| **Render** | `render.yaml` | `runtime: image`, pulls `ghcr.io/liberzon/agents-gateway:latest` directly. |
+| **Koyeb** | `koyeb.yaml` | `docker.image:` pulls the same prebuilt image. Requires Koyeb secrets to be pre-created — see [`DEPLOY_TEST_PLAN.md`](DEPLOY_TEST_PLAN.md). |
+| **Railway** | `railway.toml` + `Dockerfile` | Railway's template flow doesn't natively accept image-only deploys, so a thin wrapper `Dockerfile` does `FROM ghcr.io/liberzon/agents-gateway:latest`. The "build" is just an image pull. |
+
+All three default to `PROMPT_STORAGE_BACKEND=postgres`. You'll be prompted to fill DB credentials and at least one LLM API key (Gemini / OpenAI / Anthropic).
+
+### 2. Kubernetes (for self-hosters with their own cluster)
+
+Kustomize-based — base manifests under `k8s/base/` with per-project overlays under `k8s/overlays/`. Deploy:
+
+```bash
+gh workflow run deploy-k8s.yml \
+  -f project=agents-gateway \
+  -f environment=production \
+  -f image_tag=latest
+```
+
+Requires a `KUBECONFIG_AGENTS_GATEWAY` secret (base64-encoded kubeconfig) — see [Secrets](#kubernetes-secrets) below. For GKE workload-identity auth, see `config/projects.yaml`.
+
+---
+
+## Workflows
+
+### `docker-build.yml` — build & publish image
+
+Multi-platform (linux/amd64 + linux/arm64), pushed to GitHub Container Registry. Triggered by:
+
+- `repository_dispatch` from the app repo (on release)
+- `workflow_dispatch` (manual)
+- `workflow_call` (from `sync-upstream.yml`)
+
+```bash
+gh workflow run docker-build.yml --repo liberzon/agents-gateway-deploy \
+  -f project=agents-gateway \
+  -f ref=main \
+  -f version=0.1.0 \
+  -f trigger_deploy=false
+```
+
+Publishes to **`ghcr.io/liberzon/agents-gateway`** (public). Tags: `latest`, `<version>`, `<major>.<minor>`, `<major>`, and the source-repo short SHA.
+
+### `deploy-k8s.yml` — kustomize apply
+
+Applies the overlay for a project against the kubeconfig stored in the corresponding secret. Optional — only used by the Kubernetes deploy path.
+
+### `sync-upstream.yml` — daily upstream check
+
+Runs daily; for each project with `sync.enabled: true` in `projects.yaml`, checks for new upstream releases/tags and triggers `docker-build.yml` if there's a new one.
+
+---
+
+## Configuration
+
+### `config/projects.yaml`
+
+Central registry of projects to track and deploy. Each entry declares source, image, build platforms, and Kubernetes target:
 
 ```yaml
 projects:
@@ -39,236 +151,63 @@ projects:
     image:
       registry: ghcr.io
       name: liberzon/agents-gateway
+    build:
+      platforms:
+        - linux/amd64
+        - linux/arm64
     kubernetes:
       namespace: agents-gateway
       auth:
-        type: kubeconfig                    # or: gke, eks, aks
+        type: kubeconfig
         secretName: KUBECONFIG_AGENTS_GATEWAY
-      envFromSecrets:
-        DB_USER: DB_USER_AGENTS_GATEWAY     # Maps env var to GitHub secret
     sync:
       enabled: true
-      strategy: releases                    # or: tags, commits
+      strategy: releases
 ```
 
-## Workflows
+### Kubernetes secrets
 
-### 1. Sync Upstream (`sync-upstream.yml`)
+Only required if you use the **Kubernetes deploy path**. Not needed for one-click platform deploys.
 
-Monitors all projects for new releases.
-
-```bash
-# Check all projects
-gh workflow run sync-upstream.yml
-
-# Check specific project
-gh workflow run sync-upstream.yml -f project=agents-gateway
-```
-
-**Triggers:**
-- Daily at 6 AM UTC (scheduled)
-- Manual dispatch
-
-### 2. Docker Build (`docker-build.yml`)
-
-Builds and pushes multi-platform Docker images.
-
-```bash
-gh workflow run docker-build.yml \
-  -f project=agents-gateway \
-  -f ref=v1.0.0 \
-  -f version=1.0.0 \
-  -f trigger_deploy=true
-```
-
-**Publishes to:**
-- GitHub Container Registry: `ghcr.io/<owner>/<project>`
-- Docker Hub: `<username>/<project>`
-
-### 3. Deploy to Kubernetes (`deploy-k8s.yml`)
-
-Deploys to any Kubernetes cluster using kustomize.
-
-```bash
-gh workflow run deploy-k8s.yml \
-  -f project=agents-gateway \
-  -f environment=production \
-  -f image_tag=1.0.0
-```
-
-## Directory Structure
-
-```
-.
-├── config/
-│   └── projects.yaml           # Central project configuration
-├── k8s/
-│   ├── base/                   # Base Kubernetes manifests
-│   │   ├── kustomization.yaml
-│   │   ├── deployment.yaml
-│   │   ├── service.yaml
-│   │   └── configmap.yaml
-│   └── overlays/
-│       └── agents-gateway/     # Per-project customizations
-│           ├── kustomization.yaml
-│           └── namespace.yaml
-└── .github/workflows/
-    ├── sync-upstream.yml       # Multi-project sync
-    ├── docker-build.yml        # Parameterized builds
-    └── deploy-k8s.yml          # K8s deployment
-```
-
-## Setup Instructions
-
-### 1. Configure GitHub Secrets
-
-#### Docker Registry
 | Secret | Description |
-|--------|-------------|
-| `DOCKERHUB_USERNAME` | Docker Hub username |
-| `DOCKERHUB_TOKEN` | Docker Hub access token |
+|---|---|
+| `KUBECONFIG_AGENTS_GATEWAY` | Base64-encoded kubeconfig for the target cluster |
+| `DB_PASS_AGENTS_GATEWAY` | Database password (mapped via `envFromSecrets` in `projects.yaml`) |
+| `…_AGENTS_GATEWAY` | Other per-project secrets (see `projects.yaml`) |
 
-#### Per-Project Kubernetes Auth (Kubeconfig method)
-| Secret | Description |
-|--------|-------------|
-| `KUBECONFIG_AGENTS_GATEWAY` | Base64-encoded kubeconfig |
+Setting kubeconfig:
 
-#### Per-Project Application Secrets
-| Secret | Description |
-|--------|-------------|
-| `DB_USER_AGENTS_GATEWAY` | Database username |
-| `DB_PASS_AGENTS_GATEWAY` | Database password |
-| `DB_HOST_AGENTS_GATEWAY` | Database host |
-| ... | (other secrets as defined in projects.yaml) |
-
-### 2. Add a New Project
-
-1. **Add to projects.yaml:**
-   ```yaml
-   projects:
-     - name: my-new-project
-       source:
-         repo: org/my-new-project
-         branch: main
-       image:
-         registry: ghcr.io
-         name: org/my-new-project
-       kubernetes:
-         namespace: my-new-project
-         auth:
-           type: kubeconfig
-           secretName: KUBECONFIG_MY_NEW_PROJECT
-       sync:
-         enabled: true
-         strategy: releases
-   ```
-
-2. **Create overlay directory:**
-   ```bash
-   mkdir -p k8s/overlays/my-new-project
-   ```
-
-3. **Create kustomization.yaml:**
-   ```yaml
-   apiVersion: kustomize.config.k8s.io/v1beta1
-   kind: Kustomization
-   resources:
-     - ../../base
-     - namespace.yaml
-   namespace: my-new-project
-   namePrefix: my-new-project-
-   images:
-     - name: placeholder
-       newName: ghcr.io/org/my-new-project
-       newTag: latest
-   ```
-
-4. **Add GitHub secrets** for the new project
-
-### 3. Kubernetes Authentication Methods
-
-#### Kubeconfig (Any Cluster)
-
-```yaml
-kubernetes:
-  auth:
-    type: kubeconfig
-    secretName: KUBECONFIG_MY_PROJECT  # Base64-encoded kubeconfig
-```
-
-Generate the secret:
 ```bash
-base64 -w0 ~/.kube/config | gh secret set KUBECONFIG_MY_PROJECT
+base64 -w0 ~/.kube/config | gh secret set KUBECONFIG_AGENTS_GATEWAY \
+  --repo liberzon/agents-gateway-deploy
 ```
 
-#### GKE Native Auth
+---
 
-```yaml
-kubernetes:
-  auth:
-    type: gke
-    project: my-gcp-project
-    cluster: my-cluster
-    region: us-central1
-    serviceAccountKey: GCP_SA_KEY_MY_PROJECT
-```
+## Adding a new project
 
-## Triggering from Public Repo
+This repo is generic-enough to deploy any OSS service that ships a public OCI image. To add one:
 
-Add this workflow to your public repo to trigger deployments on release:
+1. **`config/projects.yaml`** — add a new entry under `projects:` (mirror the `agents-gateway` block).
+2. **Overlay** — `mkdir -p k8s/overlays/<name>` and create a `kustomization.yaml` referencing `../../base`, plus a `namespace.yaml`.
+3. **Secrets** — add `KUBECONFIG_<NAME>` (and any app secrets) for that project.
+4. **Run** — `gh workflow run docker-build.yml -f project=<name>`.
 
-```yaml
-# .github/workflows/release.yml
-name: Release
-
-on:
-  release:
-    types: [published]
-
-jobs:
-  notify-deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger deployment repo
-        uses: peter-evans/repository-dispatch@v2
-        with:
-          token: ${{ secrets.DEPLOY_REPO_TOKEN }}
-          repository: your-org/agents-gateway-deploy
-          event-type: upstream-release
-          client-payload: |
-            {
-              "project": "agents-gateway",
-              "ref": "${{ github.ref }}",
-              "version": "${{ github.event.release.tag_name }}"
-            }
-```
-
-## Security Notes
-
-- Never commit secrets to this repository
-- Use GitHub Secrets for all sensitive values
-- Per-project secret naming convention: `SECRET_NAME_PROJECT_NAME`
-- Keep this repository private
-- Rotate credentials regularly
+---
 
 ## Troubleshooting
 
-### Build fails with "Project not found"
-- Verify the project name exists in `config/projects.yaml`
-- Check YAML syntax with `yq e '.' config/projects.yaml`
+| Symptom | Likely cause |
+|---|---|
+| `docker-build.yml` fails at "Parse project configuration" → `Project 'X' not found` | `name` in `projects.yaml` doesn't match the workflow input `project=` |
+| Build job reports `invalid tag "/agents-gateway:..."` | (Was a real bug — see commit `71181c0`. If it recurs, check that `image.registry` and `image.name` in `projects.yaml` are non-empty.) |
+| Image push succeeds but `trigger-deploy` fails with `Resource not accessible by integration` | The default `GITHUB_TOKEN` lacks `actions:write`. Only matters for the K8s path; harmless for one-click deploys. |
+| One-click deploy gets 500 on `/v2/agents/<id>/chat` | First boot may take longer than the platform's health timeout. Try a second chat. Persistent — pull `docker logs` and open an issue on [agents-gateway](https://github.com/liberzon/agents-gateway/issues). |
+| `/health` 404s | Service hasn't finished booting; or you've set the wrong port. Render/Koyeb already use the right port; Railway uses `$PORT`. |
+| Pod `CrashLoopBackOff` on K8s | Inspect logs: `kubectl logs -n agents-gateway -l app.kubernetes.io/name=agents-gateway`. Most common cause: missing DB creds. |
 
-### Kubernetes deployment fails
-- Verify kubeconfig secret is base64-encoded
-- Test cluster connectivity: `kubectl cluster-info`
-- Check namespace exists or can be created
+---
 
-### Sync doesn't detect new releases
-- Verify `sync.enabled: true` in projects.yaml
-- Check GitHub API rate limits
-- Ensure upstream repo has published releases (not just tags)
+## License
 
-### Health check fails
-- Verify the application exposes `/health` endpoint
-- Check container logs: `kubectl logs -n <namespace> -l app.kubernetes.io/name=<project>`
-- Verify resource limits are sufficient
-
+[MIT](LICENSE) — the app source code in [`liberzon/agents-gateway`](https://github.com/liberzon/agents-gateway) is also MIT.
