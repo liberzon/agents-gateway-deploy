@@ -1,5 +1,7 @@
 # agents-gateway-deploy
 
+**📖 Docs & landing page: [agentsgateway.dev](https://agentsgateway.dev)**
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![App Python](https://img.shields.io/badge/Python%20(app)-3.11+-blue.svg)](https://github.com/liberzon/agents-gateway)
 [![Image](https://img.shields.io/badge/Image-ghcr.io%2Fliberzon%2Fagents--gateway-2496ED.svg?logo=docker)](https://github.com/liberzon/agents-gateway/pkgs/container/agents-gateway)
@@ -19,7 +21,7 @@ The app itself lives in [`liberzon/agents-gateway`](https://github.com/liberzon/
 
 [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template?template=https://github.com/liberzon/agents-gateway-deploy)
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/liberzon/agents-gateway-deploy)
-[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?type=git&repository=github.com/liberzon/agents-gateway-deploy)
+[![Deploy to Koyeb](https://img.shields.io/badge/Deploy%20to-Koyeb-121212?style=for-the-badge&logo=koyeb&logoColor=white)](https://app.koyeb.com/deploy?type=git&repository=github.com/liberzon/agents-gateway-deploy)
 
 All three pull the prebuilt image **`ghcr.io/liberzon/agents-gateway:latest`** (public, multi-arch: `linux/amd64` + `linux/arm64`). You supply DB connection + LLM API key at deploy time; the app boots and exposes the v2 API.
 
