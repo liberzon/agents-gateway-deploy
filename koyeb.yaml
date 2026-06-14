@@ -8,6 +8,8 @@ name: agents-gateway
 type: web
 
 docker:
+  # :latest is a moving tag — the deployed commit can't be read back from Koyeb.
+  # For a commit-pinned deploy, use scripts/koyeb-deploy.sh <sha> instead.
   image: ghcr.io/liberzon/agents-gateway:latest
 
 ports:
