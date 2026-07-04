@@ -107,8 +107,8 @@ jobs:
           # Health check config
           HEALTH_PATH=$(yq e ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.healthCheck.path // \"/health\"" "$CONFIG_FILE")
 
-          # Environment secrets mapping (as JSON)
-          ENV_SECRETS=$(yq e -o=json ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.envFromSecrets // {}" "$CONFIG_FILE")
+          # Environment secrets mapping (as compact single-line JSON via -I=0)
+          ENV_SECRETS=$(yq e -o=json -I=0 ".projects[] | select(.name == \"${PROJECT}\") | .kubernetes.envFromSecrets // {}" "$CONFIG_FILE")
 
           echo "namespace=${NAMESPACE}" >> $GITHUB_OUTPUT
           echo "image_registry=${IMAGE_REGISTRY}" >> $GITHUB_OUTPUT
@@ -120,7 +120,13 @@ jobs:
           echo "gke_region=${GKE_REGION}" >> $GITHUB_OUTPUT
           echo "gke_sa_secret=${GKE_SA_SECRET}" >> $GITHUB_OUTPUT
           echo "health_path=${HEALTH_PATH}" >> $GITHUB_OUTPUT
-          echo "env_secrets=${ENV_SECRETS}" >> $GITHUB_OUTPUT
+          # env_secrets is JSON; write via heredoc so any multi-line value can't break
+          # the $GITHUB_OUTPUT file command (was: "Invalid format '  \"DB_USER\": ...'").
+          {
+            echo "env_secrets<<__ENV_SECRETS_EOF__"
+            echo "${ENV_SECRETS}"
+            echo "__ENV_SECRETS_EOF__"
+          } >> "$GITHUB_OUTPUT"
 
           echo "## Deployment Configuration" >> $GITHUB_STEP_SUMMARY
           echo "- **Project:** ${PROJECT}" >> $GITHUB_STEP_SUMMARY
