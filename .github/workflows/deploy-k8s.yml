@@ -272,16 +272,25 @@ jobs:
 
           # Fail loudly rather than silently applying an empty Secret: if env_secrets
           # declared entries but none resolved to a value, something is wrong (unset
-          # source env vars, or a non-object env_secrets). Malformed JSON already aborts
-          # the step earlier via `set -e` on the jq calls above.
+          # source env vars, or a non-object env_secrets). NOTE: the loop's jq runs in a
+          # process substitution, whose non-zero exit `set -e`/`pipefail` cannot observe;
+          # the fail-closed guarantee on malformed/non-object JSON comes from the
+          # ENTRY_COUNT command substitution below (a plain assignment, so pipefail's
+          # non-zero status trips `set -e` before the guard). Keep this line.
           ENTRY_COUNT=$(echo "$ENV_SECRETS_JSON" | jq 'length')
           if [ "${ENTRY_COUNT:-0}" -gt 0 ] && [ "${#SECRET_ARGS[@]}" -eq 0 ]; then
             echo "ERROR: env_secrets declared ${ENTRY_COUNT} entries but no secret values resolved; refusing to apply an empty Secret." >&2
             exit 1
           fi
 
-          # Apply the secret — array args, no eval, so secret values are never re-parsed
-          kubectl create secret generic "${{ env.PROJECT }}-app-secrets" -n "${NAMESPACE}" \
+          # Apply the secret — array args, no eval, so secret values are never re-parsed.
+          # Name it plain "app-secrets" (NOT "${PROJECT}-app-secrets"): the pod reads it via
+          # `envFrom.secretRef.name: app-secrets` in k8s/base/deployment.yaml, and kustomize's
+          # `namePrefix` does NOT rewrite that reference because this Secret is created
+          # imperatively here (kustomize only rewrites refs to resources it manages). The name
+          # must therefore equal the base ref, or the Secret is silently ignored (optional:true).
+          # Each project deploys to its own namespace, so an unprefixed name is unambiguous.
+          kubectl create secret generic "app-secrets" -n "${NAMESPACE}" \
             "${SECRET_ARGS[@]}" --dry-run=client -o yaml | kubectl apply -f -
 
           echo "Secrets created successfully"
