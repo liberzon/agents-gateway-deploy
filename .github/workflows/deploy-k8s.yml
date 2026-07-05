@@ -247,8 +247,12 @@ jobs:
           # Start building the secret command
           SECRET_CMD="kubectl create secret generic ${{ env.PROJECT }}-app-secrets -n ${NAMESPACE}"
 
-          # Parse the env secrets JSON and create --from-literal entries
-          echo "$ENV_SECRETS_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"' | while read mapping; do
+          # Parse the env secrets JSON and create --from-literal entries.
+          # Feed the loop via process substitution, NOT `... | while`: piping into a
+          # while runs it as the last stage of a pipeline, i.e. in a SUBSHELL (bash
+          # lastpipe is off under the default `bash -eo pipefail`), so every SECRET_CMD
+          # assignment would be discarded and we'd apply a Secret with zero data keys.
+          while IFS= read -r mapping; do
             ENV_NAME="${mapping%%=*}"
             SECRET_NAME="${mapping#*=}"
 
@@ -259,7 +263,16 @@ jobs:
               echo "  - ${ENV_NAME} (from ${SECRET_NAME})"
               SECRET_CMD="$SECRET_CMD --from-literal=${ENV_NAME}=${SECRET_VALUE}"
             fi
-          done
+          done < <(echo "$ENV_SECRETS_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+
+          # Fail loudly rather than silently applying an empty Secret: if env_secrets
+          # declared entries but none resolved to a --from-literal, something is wrong
+          # (a reintroduced subshell, a parse failure, or unset source env vars).
+          ENTRY_COUNT=$(echo "$ENV_SECRETS_JSON" | jq 'length')
+          if [ "${ENTRY_COUNT:-0}" -gt 0 ] && [[ "$SECRET_CMD" != *--from-literal=* ]]; then
+            echo "ERROR: env_secrets declared ${ENTRY_COUNT} entries but no --from-literal flags were collected; refusing to apply an empty Secret." >&2
+            exit 1
+          fi
 
           # Apply the secret
           eval "$SECRET_CMD --dry-run=client -o yaml" | kubectl apply -f -
