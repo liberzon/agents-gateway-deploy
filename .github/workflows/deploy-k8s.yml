@@ -244,14 +244,19 @@ jobs:
           # Create secret from environment mappings
           echo "Creating Kubernetes secrets..."
 
-          # Start building the secret command
-          SECRET_CMD="kubectl create secret generic ${{ env.PROJECT }}-app-secrets -n ${NAMESPACE}"
+          # Collect --from-literal args in an ARRAY (not an eval'd string). Building a
+          # string + `eval` would word-split / parameter-expand / re-tokenize any secret
+          # VALUE containing a space, `$`, backtick, quote, glob, or shell metachar —
+          # silently corrupting the stored Secret (e.g. a truncated DB password -> auth
+          # outage) or even executing an embedded `$(...)`. An array passes each value
+          # verbatim as one argv element.
+          SECRET_ARGS=()
 
-          # Parse the env secrets JSON and create --from-literal entries.
+          # Parse the env secrets JSON and collect --from-literal entries.
           # Feed the loop via process substitution, NOT `... | while`: piping into a
           # while runs it as the last stage of a pipeline, i.e. in a SUBSHELL (bash
-          # lastpipe is off under the default `bash -eo pipefail`), so every SECRET_CMD
-          # assignment would be discarded and we'd apply a Secret with zero data keys.
+          # lastpipe is off under the default `bash -eo pipefail`), so every SECRET_ARGS
+          # append would be discarded and we'd apply a Secret with zero data keys.
           while IFS= read -r mapping; do
             ENV_NAME="${mapping%%=*}"
             SECRET_NAME="${mapping#*=}"
@@ -261,21 +266,23 @@ jobs:
 
             if [ -n "$SECRET_VALUE" ]; then
               echo "  - ${ENV_NAME} (from ${SECRET_NAME})"
-              SECRET_CMD="$SECRET_CMD --from-literal=${ENV_NAME}=${SECRET_VALUE}"
+              SECRET_ARGS+=(--from-literal="${ENV_NAME}=${SECRET_VALUE}")
             fi
           done < <(echo "$ENV_SECRETS_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
 
           # Fail loudly rather than silently applying an empty Secret: if env_secrets
-          # declared entries but none resolved to a --from-literal, something is wrong
-          # (a reintroduced subshell, a parse failure, or unset source env vars).
+          # declared entries but none resolved to a value, something is wrong (unset
+          # source env vars, or a non-object env_secrets). Malformed JSON already aborts
+          # the step earlier via `set -e` on the jq calls above.
           ENTRY_COUNT=$(echo "$ENV_SECRETS_JSON" | jq 'length')
-          if [ "${ENTRY_COUNT:-0}" -gt 0 ] && [[ "$SECRET_CMD" != *--from-literal=* ]]; then
-            echo "ERROR: env_secrets declared ${ENTRY_COUNT} entries but no --from-literal flags were collected; refusing to apply an empty Secret." >&2
+          if [ "${ENTRY_COUNT:-0}" -gt 0 ] && [ "${#SECRET_ARGS[@]}" -eq 0 ]; then
+            echo "ERROR: env_secrets declared ${ENTRY_COUNT} entries but no secret values resolved; refusing to apply an empty Secret." >&2
             exit 1
           fi
 
-          # Apply the secret
-          eval "$SECRET_CMD --dry-run=client -o yaml" | kubectl apply -f -
+          # Apply the secret — array args, no eval, so secret values are never re-parsed
+          kubectl create secret generic "${{ env.PROJECT }}-app-secrets" -n "${NAMESPACE}" \
+            "${SECRET_ARGS[@]}" --dry-run=client -o yaml | kubectl apply -f -
 
           echo "Secrets created successfully"
 
